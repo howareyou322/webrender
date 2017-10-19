@@ -22,12 +22,12 @@ args:
       help: Rebuild display list from scratch every frame
   - save:
       long: save
-      help: 'Save frames, one of: yaml, json, or binary'
+      help: 'Save frames, one of: yaml, json, ron, or binary'
       takes_value: true
-  - subpixel_aa:
+  - no_subpixel_aa:
       short: a
-      long: subpixel-aa
-      help: Enable subpixel aa
+      long: no-subpixel-aa
+      help: Disable subpixel aa
   - headless:
       short: h
       long: headless
@@ -50,6 +50,12 @@ args:
   - vsync:
       long: vsync
       help: Enable vsync for OpenGL window
+  - no_scissor:
+      long: no-scissor
+      help: Disable scissors when clearing render targets
+  - no_batch:
+      long: no-batch
+      help: Disable batching of instanced draw calls
 
 subcommands:
     - png:
@@ -72,6 +78,9 @@ subcommands:
               help: Include the given element type. Can be specified multiple times. (rect/image/text/glyphs/border)
               multiple: true
               takes_value: true
+          - list-resources:
+              long: list-resources
+              help: List the resources used by this YAML file
           - watch:
               short: w
               long: watch
@@ -99,10 +108,17 @@ subcommands:
     - reftest:
         about: run reftests
         args:
+          - fuzz_tolerance:
+              long: fuzzy
+              takes_value: true
+              help: Add a minimum fuzziness tolerance to all tests.
+              required: false
           - REFTEST:
               help: a specific reftest or directory to run
               required: false
               index: 1
+    - rawtest:
+        about: run rawtests
     - perf:
         about: run benchmarks
         args:

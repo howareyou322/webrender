@@ -3,8 +3,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use std::collections::HashMap;
-use webrender_traits::{AuxiliaryLists, BuiltDisplayList, ColorF, DisplayItem, Epoch};
-use webrender_traits::{LayerSize, PipelineId};
+use webrender::api::{BuiltDisplayList, ColorF, Epoch};
+use webrender::api::{LayerSize, PipelineId};
 
 /// A representation of the layout within the display port for a given document or iframe.
 #[derive(Debug)]
@@ -18,17 +18,15 @@ pub struct ScenePipeline {
 pub struct Scene {
     pub root_pipeline_id: Option<PipelineId>,
     pub pipeline_map: HashMap<PipelineId, ScenePipeline>,
-    pub pipeline_auxiliary_lists: HashMap<PipelineId, AuxiliaryLists>,
-    pub display_lists: HashMap<PipelineId, Vec<DisplayItem>>,
+    pub display_lists: HashMap<PipelineId, BuiltDisplayList>,
 }
 
 impl Scene {
     pub fn new() -> Scene {
         Scene {
             root_pipeline_id: None,
-            pipeline_map: HashMap::with_hasher(Default::default()),
-            pipeline_auxiliary_lists: HashMap::with_hasher(Default::default()),
-            display_lists: HashMap::with_hasher(Default::default()),
+            pipeline_map: HashMap::default(),
+            display_lists: HashMap::default(),
         }
     }
 
@@ -36,25 +34,35 @@ impl Scene {
         self.root_pipeline_id = Some(pipeline_id);
     }
 
-    pub fn begin_root_display_list(&mut self,
-                                   pipeline_id: &PipelineId,
-                                   epoch: &Epoch,
-                                   background_color: &Option<ColorF>,
-                                   viewport_size: &LayerSize) {
+    pub fn remove_pipeline(&mut self, pipeline_id: &PipelineId) {
+        if self.root_pipeline_id == Some(*pipeline_id) {
+            self.root_pipeline_id = None;
+        }
+        self.pipeline_map.remove(pipeline_id);
+        self.display_lists.remove(pipeline_id);
+    }
+
+    pub fn begin_display_list(
+        &mut self,
+        pipeline_id: &PipelineId,
+        epoch: &Epoch,
+        background_color: &Option<ColorF>,
+        viewport_size: &LayerSize,
+    ) {
         let new_pipeline = ScenePipeline {
-             epoch: epoch.clone(),
-             viewport_size: viewport_size.clone(),
-             background_color: background_color.clone(),
+            epoch: epoch.clone(),
+            viewport_size: viewport_size.clone(),
+            background_color: background_color.clone(),
         };
 
         self.pipeline_map.insert(pipeline_id.clone(), new_pipeline);
     }
 
-    pub fn finish_root_display_list(&mut self,
-                                    pipeline_id: PipelineId,
-                                    built_display_list: BuiltDisplayList,
-                                    auxiliary_lists: AuxiliaryLists) {
-        self.pipeline_auxiliary_lists.insert(pipeline_id, auxiliary_lists);
-        self.display_lists.insert(pipeline_id, built_display_list.all_display_items().to_vec());
+    pub fn finish_display_list(
+        &mut self,
+        pipeline_id: PipelineId,
+        built_display_list: BuiltDisplayList,
+    ) {
+        self.display_lists.insert(pipeline_id, built_display_list);
     }
 }

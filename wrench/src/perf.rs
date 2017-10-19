@@ -10,14 +10,17 @@ use std::io::{BufRead, BufReader};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use webrender_traits::*;
+use webrender::api::*;
 use wrench::{Wrench, WrenchThing};
 use yaml_frame_reader::YamlFrameReader;
 
-const COLOR_DEFAULT: &'static str = "\x1b[0m";
-const COLOR_RED: &'static str = "\x1b[31m";
-const COLOR_GREEN: &'static str = "\x1b[32m";
-const COLOR_MAGENTA: &'static str = "\x1b[95m";
+const COLOR_DEFAULT: &str = "\x1b[0m";
+const COLOR_RED: &str = "\x1b[31m";
+const COLOR_GREEN: &str = "\x1b[32m";
+const COLOR_MAGENTA: &str = "\x1b[95m";
+
+const MIN_SAMPLE_COUNT: usize = 50;
+const SAMPLE_EXCLUDE_COUNT: usize = 10;
 
 pub struct Benchmark {
     pub test: PathBuf,
@@ -30,7 +33,8 @@ pub struct BenchmarkManifest {
 impl BenchmarkManifest {
     pub fn new(manifest: &Path) -> BenchmarkManifest {
         let dir = manifest.parent().unwrap();
-        let f = File::open(manifest).expect(&format!("couldn't open manifest: {}", manifest.display()));
+        let f =
+            File::open(manifest).expect(&format!("couldn't open manifest: {}", manifest.display()));
         let file = BufReader::new(&f);
 
         let mut benchmarks = Vec::new();
@@ -39,9 +43,9 @@ impl BenchmarkManifest {
             let l = line.unwrap();
 
             // strip the comments
-            let s = &l[0..l.find("#").unwrap_or(l.len())];
+            let s = &l[0 .. l.find('#').unwrap_or(l.len())];
             let s = s.trim();
-            if s.len() == 0 {
+            if s.is_empty() {
                 continue;
             }
 
@@ -55,16 +59,14 @@ impl BenchmarkManifest {
                 }
                 Some(name) => {
                     let test = dir.join(name);
-                    benchmarks.push(Benchmark {
-                        test: test,
-                    });
+                    benchmarks.push(Benchmark { test });
                 }
                 _ => panic!(),
             };
         }
 
         BenchmarkManifest {
-            benchmarks: benchmarks
+            benchmarks: benchmarks,
         }
     }
 }
@@ -72,6 +74,7 @@ impl BenchmarkManifest {
 #[derive(Clone, Serialize, Deserialize)]
 struct TestProfile {
     name: String,
+    backend_time_ns: u64,
     composite_time_ns: u64,
     paint_time_ns: u64,
     draw_calls: usize,
@@ -84,9 +87,7 @@ struct Profile {
 
 impl Profile {
     fn new() -> Profile {
-        Profile {
-            tests: Vec::new(),
-        }
+        Profile { tests: Vec::new() }
     }
 
     fn add(&mut self, profile: TestProfile) {
@@ -127,9 +128,7 @@ pub struct PerfHarness<'a> {
 }
 
 impl<'a> PerfHarness<'a> {
-    pub fn new(wrench: &'a mut Wrench,
-               window: &'a mut WindowWrapper) -> PerfHarness<'a>
-    {
+    pub fn new(wrench: &'a mut Wrench, window: &'a mut WindowWrapper) -> PerfHarness<'a> {
         // setup a notifier so we can wait for frames to be finished
         struct Notifier {
             tx: Sender<()>,
@@ -141,13 +140,11 @@ impl<'a> PerfHarness<'a> {
             fn new_scroll_frame_ready(&mut self, _composite_needed: bool) {}
         }
         let (tx, rx) = channel();
-        wrench.renderer.set_render_notifier(Box::new(Notifier { tx: tx }));
+        wrench
+            .renderer
+            .set_render_notifier(Box::new(Notifier { tx: tx }));
 
-        PerfHarness {
-            wrench: wrench,
-            window: window,
-            rx: rx,
-        }
+        PerfHarness { wrench, window, rx }
     }
 
     pub fn run(mut self, base_manifest: &Path, filename: &str) {
@@ -165,18 +162,17 @@ impl<'a> PerfHarness<'a> {
 
     fn render_yaml(&mut self, filename: &Path) -> TestProfile {
         let mut reader = YamlFrameReader::new(filename);
-        reader.do_frame(self.wrench);
-
-        // wait for the frame
-        self.rx.recv().unwrap();
 
         // Loop until we get a reasonable number of CPU and GPU
         // frame profiles. Then take the mean.
         let mut cpu_frame_profiles = Vec::new();
         let mut gpu_frame_profiles = Vec::new();
 
-        while cpu_frame_profiles.len() < 10 ||
-              gpu_frame_profiles.len() < 10 {
+        while cpu_frame_profiles.len() < MIN_SAMPLE_COUNT ||
+            gpu_frame_profiles.len() < MIN_SAMPLE_COUNT
+        {
+            reader.do_frame(self.wrench);
+            self.rx.recv().unwrap();
             self.wrench.render();
             self.window.swap_buffers();
             let (cpu_profiles, gpu_profiles) = self.wrench.get_frame_profiles();
@@ -186,30 +182,35 @@ impl<'a> PerfHarness<'a> {
 
         // Ensure the draw calls match in every sample.
         let draw_calls = cpu_frame_profiles[0].draw_calls;
-        assert!(cpu_frame_profiles.iter().all(|s| s.draw_calls == draw_calls));
+        assert!(
+            cpu_frame_profiles
+                .iter()
+                .all(|s| s.draw_calls == draw_calls)
+        );
 
-        cpu_frame_profiles.sort_by_key(|a| a.composite_time_ns);
-        gpu_frame_profiles.sort_by_key(|a| a.paint_time_ns);
-
-        // Remove the two slowest and fastest frames.
-        let cpu_samples = &cpu_frame_profiles[2..cpu_frame_profiles.len() - 2];
-        let gpu_samples = &gpu_frame_profiles[2..gpu_frame_profiles.len() - 2];
-
-        // Use the mean value from the remaining frames.
-        let composite_time: u64 = cpu_samples.iter()
-                                             .map(|s| s.composite_time_ns)
-                                             .sum();
-        let paint_time: u64 = gpu_samples.iter()
-                                         .map(|s| s.paint_time_ns)
-                                         .sum();
+        let composite_time_ns = extract_sample(&mut cpu_frame_profiles, |a| a.composite_time_ns);
+        let paint_time_ns = extract_sample(&mut gpu_frame_profiles, |a| a.paint_time_ns);
+        let backend_time_ns = extract_sample(&mut cpu_frame_profiles, |a| a.backend_time_ns);
 
         TestProfile {
             name: filename.to_str().unwrap().to_string(),
-            composite_time_ns: composite_time / cpu_samples.len() as u64,
-            paint_time_ns: paint_time / gpu_samples.len() as u64,
-            draw_calls: draw_calls,
+            composite_time_ns,
+            paint_time_ns,
+            backend_time_ns,
+            draw_calls,
         }
     }
+}
+
+fn extract_sample<F, T>(profiles: &mut [T], f: F) -> u64
+where
+    F: Fn(&T) -> u64,
+{
+    let mut samples: Vec<u64> = profiles.iter().map(f).collect();
+    samples.sort();
+    let useful_samples = &samples[SAMPLE_EXCLUDE_COUNT .. samples.len() - SAMPLE_EXCLUDE_COUNT];
+    let total_time: u64 = useful_samples.iter().sum();
+    total_time / useful_samples.len() as u64
 }
 
 fn select_color(base: f32, value: f32) -> &'static str {
@@ -230,12 +231,23 @@ pub fn compare(first_filename: &str, second_filename: &str) {
     let (set0, map0) = profile0.build_set_and_map_of_tests();
     let (set1, map1) = profile1.build_set_and_map_of_tests();
 
-    println!("+------------------------------------------------+--------------+------------------+------------------+");
-    println!("|  Test name                                     | Draw Calls   | Composite (ms)   | Paint (ms)       |");
-    println!("+------------------------------------------------+--------------+------------------+------------------+");
+    print!("+------------------------------------------------");
+    println!("+--------------+------------------+------------------+");
+    print!("|  Test name                                     ");
+    println!("| Draw Calls   | Composite (ms)   | Paint (ms)       |");
+    print!("+------------------------------------------------");
+    println!("+--------------+------------------+------------------+");
 
     for test_name in set0.symmetric_difference(&set1) {
-        println!("| {}{:47}{}|{:14}|{:18}|{:18}|", COLOR_MAGENTA, test_name, COLOR_DEFAULT, " -", " -", " -");
+        println!(
+            "| {}{:47}{}|{:14}|{:18}|{:18}|",
+            COLOR_MAGENTA,
+            test_name,
+            COLOR_DEFAULT,
+            " -",
+            " -",
+            " -"
+        );
     }
 
     for test_name in set0.intersection(&set1) {
@@ -260,22 +272,24 @@ pub fn compare(first_filename: &str, second_filename: &str) {
         let paint_time_color = select_color(paint_time0, paint_time1);
 
         let draw_call_string = format!(" {} -> {}", test0.draw_calls, test1.draw_calls);
-        let composite_time_string = format!(" {:.2} -> {:.2}", composite_time0,
-                                                               composite_time1);
-        let paint_time_string = format!(" {:.2} -> {:.2}", paint_time0,
-                                                           paint_time1);
+        let composite_time_string = format!(" {:.2} -> {:.2}", composite_time0, composite_time1);
+        let paint_time_string = format!(" {:.2} -> {:.2}", paint_time0, paint_time1);
 
-        println!("| {:47}|{}{:14}{}|{}{:18}{}|{}{:18}{}|", test_name,
-                                                           draw_calls_color,
-                                                           draw_call_string,
-                                                           COLOR_DEFAULT,
-                                                           composite_time_color,
-                                                           composite_time_string,
-                                                           COLOR_DEFAULT,
-                                                           paint_time_color,
-                                                           paint_time_string,
-                                                           COLOR_DEFAULT);
+        println!(
+            "| {:47}|{}{:14}{}|{}{:18}{}|{}{:18}{}|",
+            test_name,
+            draw_calls_color,
+            draw_call_string,
+            COLOR_DEFAULT,
+            composite_time_color,
+            composite_time_string,
+            COLOR_DEFAULT,
+            paint_time_color,
+            paint_time_string,
+            COLOR_DEFAULT
+        );
     }
 
-    println!("+------------------------------------------------+--------------+------------------+------------------+");
+    print!("+------------------------------------------------");
+    println!("+--------------+------------------+------------------+");
 }

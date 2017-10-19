@@ -11,7 +11,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::{mem, process};
 use webrender::WEBRENDER_RECORDING_HEADER;
-use webrender_traits::ApiMsg;
+use webrender::api::{ApiMsg, DocumentMsg};
 use wrench::{Wrench, WrenchThing};
 
 #[derive(Clone)]
@@ -38,24 +38,28 @@ impl BinaryFrameReader {
     pub fn new(file_path: &Path) -> BinaryFrameReader {
         let mut file = File::open(&file_path).expect("Can't open recording file");
         let header = file.read_u64::<LittleEndian>().unwrap();
-        if header != WEBRENDER_RECORDING_HEADER {
-            panic!("Binary recording is missing recording header!");
-        }
+        assert_eq!(
+            header,
+            WEBRENDER_RECORDING_HEADER,
+            "Binary recording is missing recording header!"
+        );
 
         let apimsg_type_id = unsafe {
-            assert!(mem::size_of::<TypeId>() == mem::size_of::<u64>());
+            assert_eq!(mem::size_of::<TypeId>(), mem::size_of::<u64>());
             mem::transmute::<TypeId, u64>(TypeId::of::<ApiMsg>())
         };
 
         let written_apimsg_type_id = file.read_u64::<LittleEndian>().unwrap();
         if written_apimsg_type_id != apimsg_type_id {
-            println!("Warning: binary file ApiMsg type mismatch: expected 0x{:x}, found 0x{:x}",
-                     apimsg_type_id,
-                     written_apimsg_type_id);
+            println!(
+                "Warning: binary file ApiMsg type mismatch: expected 0x{:x}, found 0x{:x}",
+                apimsg_type_id,
+                written_apimsg_type_id
+            );
         }
 
         BinaryFrameReader {
-            file: file,
+            file,
             eof: false,
             frame_offsets: vec![],
 
@@ -90,17 +94,9 @@ impl BinaryFrameReader {
             return false;
         }
 
-        match msg {
-            &ApiMsg::AddRawFont(..) |
-            &ApiMsg::AddNativeFont(..) |
-            &ApiMsg::AddImage(..) |
-            &ApiMsg::UpdateImage(..) |
-            &ApiMsg::DeleteImage(..) => {
-                true
-            }
-            _ => {
-                false
-            }
+        match *msg {
+            ApiMsg::UpdateResources(..) => true,
+            _ => false,
         }
     }
 
@@ -129,14 +125,40 @@ impl WrenchThing for BinaryFrameReader {
             wrench.set_title(&format!("frame {}", self.frame_num));
 
             self.frame_data.clear();
+            let mut found_frame_marker = false;
+            let mut found_display_list = false;
+            let mut found_pipeline = false;
             while let Ok(mut len) = self.file.read_u32::<LittleEndian>() {
                 if len > 0 {
                     let mut buffer = vec![0; len as usize];
                     self.file.read_exact(&mut buffer).unwrap();
                     let msg = deserialize(&buffer).unwrap();
-                    let found_frame_marker = match &msg { &ApiMsg::GenerateFrame(..) => true, _ => false };
+                    // In order to detect the first valid frame, we
+                    // need to find:
+                    // (a) SetRootPipeline
+                    // (b) SetDisplayList
+                    // (c) GenerateFrame that occurs *after* (a) and (b)
+                    match msg {
+                        ApiMsg::UpdateDocument(_, DocumentMsg::GenerateFrame(..)) => {
+                            found_frame_marker = true;
+                        }
+                        ApiMsg::UpdateDocument(_, DocumentMsg::SetDisplayList { .. }) => {
+                            found_frame_marker = false;
+                            found_display_list = true;
+                        }
+                        ApiMsg::UpdateDocument(_, DocumentMsg::SetRootPipeline(..)) => {
+                            found_frame_marker = false;
+                            found_pipeline = true;
+                        }
+                        _ => {}
+                    }
                     self.frame_data.push(Item::Message(msg));
-                    if found_frame_marker {
+                    // Frames are marked by the GenerateFrame message.
+                    // On the first frame, we additionally need to find at least
+                    // a SetDisplayList and a SetRootPipeline.
+                    // After the first frame, any GenerateFrame message marks a new
+                    // frame being rendered.
+                    if found_frame_marker && (self.frame_num > 0 || (found_display_list && found_pipeline)) {
                         break;
                     }
                 } else {
@@ -148,7 +170,8 @@ impl WrenchThing for BinaryFrameReader {
             }
 
             if self.eof == false &&
-               self.file.seek(SeekFrom::Current(0)).unwrap() == self.file.metadata().unwrap().len() {
+                self.file.seek(SeekFrom::Current(0)).unwrap() == self.file.metadata().unwrap().len()
+            {
                 self.eof = true;
             }
 
@@ -160,13 +183,11 @@ impl WrenchThing for BinaryFrameReader {
             let frame_items = self.frame_data.clone();
             for item in frame_items {
                 match item {
-                    Item::Message(msg) => {
-                        if !self.should_skip_upload_msg(&msg) {
-                            wrench.api.api_sender.send(msg).unwrap();
-                        }
-                    }
+                    Item::Message(msg) => if !self.should_skip_upload_msg(&msg) {
+                        wrench.api.send_message(msg);
+                    },
                     Item::Data(buf) => {
-                        wrench.api.payload_sender.send(buf).unwrap();
+                        wrench.api.send_payload(&buf);
                     }
                 }
             }

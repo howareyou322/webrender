@@ -1,10 +1,10 @@
 [workspace]
 members = [
     "webrender",
-    "webrender_traits",
-    "sample",
+    "webrender_api",
     "wrench",
 ]
 
 [profile.release]
 debug = true
+panic = "abort"
